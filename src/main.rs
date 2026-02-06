@@ -174,6 +174,9 @@ pub struct ListenTcpArgs {
     #[clap(long)]
     pub host: String,
 
+    #[clap(long)]
+    pub sfn: PathBuf,
+
     #[clap(flatten)]
     pub common: CommonArgs,
 }
@@ -281,16 +284,18 @@ async fn copy_from_quinn(
 
 /// Get the secret key or generate a new one.
 ///
-/// Print the secret key to stderr if it was generated, so the user can save it.
-fn get_or_create_secret() -> Result<SecretKey> {
-    match std::env::var("IROH_SECRET") {
-        Ok(secret) => SecretKey::from_str(&secret).std_context("invalid secret"),
-        Err(_) => {
+/// Persist key for later use
+fn get_or_create_secret(sfn: PathBuf) -> Result<SecretKey> {
+    match std::fs::metadata(&sfn) {
+        Ok(_) => {
+            let secret = std::fs::read_to_string(&sfn)?;
+            Ok(SecretKey::from_str(&secret).std_context("invalid secret")?)
+        } Err(_) => {
             let key = SecretKey::generate(&mut rand::rng());
             eprintln!(
-                "using secret key {}",
-                data_encoding::HEXLOWER.encode(&key.to_bytes())
+                "generated new key"
             );
+            std::fs::write(&sfn, data_encoding::HEXLOWER.encode(&key.to_bytes()))?;
             Ok(key)
         }
     }
@@ -353,7 +358,7 @@ async fn forward_bidi(
 }
 
 async fn listen_stdio(args: ListenArgs) -> Result<()> {
-    let secret_key = get_or_create_secret()?;
+    let secret_key = SecretKey::generate(&mut rand::rng());
     let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     // wait for the endpoint to figure out its home relay and addresses before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
@@ -417,7 +422,7 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
 }
 
 async fn connect_stdio(args: ConnectArgs) -> Result<()> {
-    let secret_key = get_or_create_secret()?;
+    let secret_key = SecretKey::generate(&mut rand::rng());
     let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
     let addr = args.ticket.endpoint_addr();
     let remote_endpoint_id = addr.id;
@@ -457,7 +462,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         .addr
         .to_socket_addrs()
         .std_context(format!("invalid host string {}", args.addr))?;
-    let secret_key = get_or_create_secret()?;
+    let secret_key = SecretKey::generate(&mut rand::rng());
     let endpoint = create_endpoint(secret_key, &args.common, vec![])
         .await
         .std_context("unable to bind endpoint")?;
@@ -534,12 +539,13 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
 }
 
 /// Listen on an endpoint and forward incoming connections to a tcp socket.
+// Persist the secret key
 async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
     let addrs = match args.host.to_socket_addrs() {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => bail_any!("invalid host string {}: {}", args.host, e),
     };
-    let secret_key = get_or_create_secret()?;
+    let secret_key = get_or_create_secret(args.sfn)?;
     let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     // wait for the endpoint to figure out its address before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
@@ -637,7 +643,7 @@ fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
 /// Listen on an endpoint and forward incoming connections to a Unix socket.
 async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
     let socket_path = args.socket_path.clone();
-    let secret_key = get_or_create_secret()?;
+    let secret_key = SecretKey::generate(&mut rand::rng());
     let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     // wait for the endpoint to figure out its address before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
@@ -755,7 +761,7 @@ impl Drop for UnixSocketGuard {
 /// Listen on a Unix socket and forward connections to an endpoint.
 async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
     let socket_path = args.socket_path.clone();
-    let secret_key = get_or_create_secret()?;
+    let secret_key = SecretKey::generate(&mut rand::rng());
     let endpoint = create_endpoint(secret_key, &args.common, vec![])
         .await
         .std_context("unable to bind endpoint")?;
@@ -854,7 +860,7 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
 }
 
 async fn generate_ticket() -> Result<()> {
-    let secret_key = get_or_create_secret()?;
+    let secret_key = SecretKey::generate(&mut rand::rng());
     let public_key = secret_key.public();
     let addr = EndpointAddr::new(public_key);
     let ticket = EndpointTicket::new(addr);
